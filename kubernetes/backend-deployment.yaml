@@ -1,0 +1,64 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: backend
+  namespace: agentforge
+  labels:
+    app: backend
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: backend
+  template:
+    metadata:
+      labels:
+        app: backend
+    spec:
+      containers:
+        - name: backend
+          image: agentforge/backend:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8000
+          env:
+            - name: DATABASE_URL
+              value: "postgresql://postgres:secretpassword@postgres:5432/agentforge"
+            - name: OLLAMA_BASE_URL
+              value: "http://ollama-service:11434"
+            - name: SECRET_KEY
+              value: "agentforge-super-secret-key-change-in-prod-123456"
+            - name: CHROMA_DB_PATH
+              value: "/app/chroma_data"
+          volumeMounts:
+            - name: chroma-storage
+              mountPath: /app/chroma_data
+      volumes:
+        - name: chroma-storage
+          persistentVolumeClaim:
+            claimName: chroma-storage-pvc
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: chroma-storage-pvc
+  namespace: agentforge
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 5Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: backend
+  namespace: agentforge
+spec:
+  ports:
+    - port: 8000
+      targetPort: 8000
+  selector:
+    app: backend
+  type: ClusterIP

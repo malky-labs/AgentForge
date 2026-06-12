@@ -106,6 +106,24 @@ Final Answer: [your response text]
         tools_prompt = self._format_tools_prompt(tools)
         system_content = f"{agent.system_prompt}{tools_prompt}"
         
+        # Inject RAG citations if a knowledge collection is linked
+        query = ""
+        for msg in reversed(conversation_history):
+            if msg.get("role") == "user":
+                query = msg.get("content", "")
+                break
+        if agent.knowledge_collection_id and query:
+            try:
+                from app.services.rag_engine import rag_engine
+                citations = await rag_engine.build_citations_context(
+                    collection_id=str(agent.knowledge_collection_id),
+                    query=query
+                )
+                if citations:
+                    system_content = f"{system_content}\n{citations}"
+            except Exception as e:
+                logger.error(f"Error building citations context for agent '{agent.name}': {e}")
+
         messages = [{"role": "system", "content": system_content}]
         messages.extend(conversation_history)
         

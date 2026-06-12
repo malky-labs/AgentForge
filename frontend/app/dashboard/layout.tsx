@@ -11,7 +11,9 @@ import {
   LogOut, 
   Activity,
   Menu,
-  X
+  X,
+  Library,
+  Settings as SettingsIcon
 } from 'lucide-react';
 import { useAppStore } from '../../lib/store';
 import { getAuthToken } from '../../lib/api';
@@ -45,6 +47,8 @@ export default function DashboardLayout({
     { name: 'Agent Hub', href: '/dashboard/agents', icon: Users },
     { name: 'MCP Servers', href: '/dashboard/mcp', icon: Cpu },
     { name: 'Workflows', href: '/dashboard/workflows', icon: GitBranch },
+    { name: 'Knowledge Base', href: '/dashboard/knowledge', icon: Library },
+    { name: 'Settings', href: '/dashboard/settings', icon: SettingsIcon },
   ];
 
   if (!user) {

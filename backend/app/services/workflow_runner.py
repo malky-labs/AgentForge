@@ -5,10 +5,11 @@ from datetime import datetime
 from typing import Dict, Any, List, Optional
 from collections import deque
 from sqlmodel import Session, select
-from app.models.schemas import Workflow, WorkflowExecution, Agent, Tool
+from app.models.schemas import Workflow, WorkflowExecution, Agent, Tool, WorkflowNodeExecutionLog
 from app.services.agent_runner import agent_runner
 from app.services.mcp_manager import mcp_manager
 from app.services.ollama import ollama_service
+from app.services.webhook_dispatcher import webhook_dispatcher
 
 logger = logging.getLogger("AgentForge.WorkflowRunner")
 
@@ -91,7 +92,7 @@ class WorkflowRunner:
 
         try:
             nodes, adj_list, in_degrees = self._parse_graph(workflow.graph_json)
-            execution_order = self.check_for_cycles(nodes, adj_list, in_degrees)
+            self.check_for_cycles(nodes, adj_list, in_degrees)
         except Exception as e:
             execution.state = "failed"
             execution.error_message = str(e)
@@ -100,106 +101,183 @@ class WorkflowRunner:
             session.commit()
             return
 
-        # Execute node by node topologically
+        # Setup parents mapping
+        parents: Dict[str, List[str]] = {n_id: [] for n_id in nodes}
+        for n_src, targets in adj_list.items():
+            for tgt in targets:
+                parents[tgt].append(n_src)
+
+        node_states: Dict[str, str] = {n_id: "pending" for n_id in nodes}
+        node_tasks: Dict[str, asyncio.Task] = {}
         node_outputs: Dict[str, Any] = {}
-        
-        try:
-            for node_id in execution_order:
-                node = nodes[node_id]
-                node_type = node.get("type")
-                node_data = node.get("data", {})
-                
-                logger.info(f"Executing workflow node: {node_id} (Type: {node_type})")
-                
-                # Fetch inputs from parent nodes if configured
-                input_prompt = node_data.get("prompt", "")
-                
-                # If there is parent context, prepend it
-                parent_context = ""
-                for n_src, targets in adj_list.items():
-                    if node_id in targets and n_src in node_outputs:
-                        parent_context += f"\n[Context from parent node '{nodes[n_src].get('data', {}).get('name', n_src)}']:\n{node_outputs[n_src]}\n"
-                
-                if parent_context:
-                    input_prompt = f"{parent_context}\nTask prompt: {input_prompt}"
 
-                output_str = ""
+        async def run_single_node(node_id: str):
+            node = nodes[node_id]
+            node_type = node.get("type")
+            node_data = node.get("data", {})
 
-                if node_type == "agentNode":
-                    # Execute Agent persona loop
-                    agent_id = node_data.get("agentId")
-                    if not agent_id:
-                        raise Exception(f"AgentNode '{node_id}' is missing a configured agent persona.")
-                    
-                    from uuid import UUID as uuid_cast
-                    agent = session.get(Agent, uuid_cast(agent_id))
-                    if not agent:
-                        raise Exception(f"Agent persona '{agent_id}' linked to node '{node_id}' does not exist.")
-                    
-                    history = [{"role": "user", "content": input_prompt}]
-                    
-                    # Call ReAct executor
-                    last_chunk = None
-                    async for chunk in agent_runner.execute_react_loop(
-                        agent=agent,
-                        conversation_history=history,
-                        session=session
-                    ):
-                        if chunk["type"] == "final_answer":
-                            output_str = chunk["content"]
-                        elif chunk["type"] == "error":
-                            raise Exception(f"Agent loop error inside node '{node_id}': {chunk['content']}")
-                    
-                    if not output_str:
-                        output_str = "Agent completed execution with no response."
+            # Setup checkpoint log
+            db_log = WorkflowNodeExecutionLog(
+                workflow_execution_id=execution.id,
+                node_id=node_id,
+                node_name=node_data.get("name", node_id),
+                node_type=node_type,
+                state="running",
+                started_at=datetime.utcnow()
+            )
+            session.add(db_log)
+            session.commit()
+            session.refresh(db_log)
 
-                elif node_type == "toolNode":
-                    # Direct tool execution
-                    tool_name = node_data.get("toolName")
-                    if not tool_name:
-                        raise Exception(f"ToolNode '{node_id}' has no toolName specified.")
-                    
-                    tool_args = node_data.get("arguments", {})
-                    # If arguments contain variables, interpolate them from context state
-                    # For simplicity, we directly execute with args
-                    
-                    if tool_name == "python_sandbox":
-                        code = tool_args.get("code", "")
-                        from app.services.agent_runner import execute_python_sandbox
-                        output_str = await execute_python_sandbox(code)
-                    else:
-                        mcp_client = await mcp_manager.get_tool_client(tool_name, session)
-                        if not mcp_client:
-                            raise Exception(f"MCP client for tool '{tool_name}' is not running.")
-                        
-                        tool_result = await mcp_client.call_tool(tool_name, tool_args)
-                        
-                        # Extract text
-                        content_blocks = tool_result.get("content", [])
-                        for block in content_blocks:
-                            if block.get("type") == "text":
-                                output_str += block.get("text", "")
+            max_retries = int(node_data.get("retries", 0))
+            backoff_seconds = float(node_data.get("retry_backoff", 2.0))
+            attempts = 0
+
+            while True:
+                try:
+                    # Prepend parent output contexts
+                    parent_context = ""
+                    for p_id in parents[node_id]:
+                        if p_id in node_outputs:
+                            parent_context += f"\n[Context from parent node '{nodes[p_id].get('data', {}).get('name', p_id)}']:\n{node_outputs[p_id]}\n"
+
+                    input_prompt = node_data.get("prompt", "")
+                    if parent_context:
+                        input_prompt = f"{parent_context}\nTask prompt: {input_prompt}"
+
+                    db_log.input_data = input_prompt
+                    session.add(db_log)
+                    session.commit()
+
+                    output_str = ""
+                    if node_type == "agentNode":
+                        agent_id = node_data.get("agentId")
+                        if not agent_id:
+                            raise Exception("AgentNode is missing configured agent persona.")
+
+                        from uuid import UUID as uuid_cast
+                        agent = session.get(Agent, uuid_cast(agent_id))
+                        if not agent:
+                            raise Exception(f"Agent persona '{agent_id}' does not exist.")
+
+                        history = [{"role": "user", "content": input_prompt}]
+                        async for chunk in agent_runner.execute_react_loop(
+                            agent=agent,
+                            conversation_history=history,
+                            session=session
+                        ):
+                            if chunk["type"] == "final_answer":
+                                output_str = chunk["content"]
+                            elif chunk["type"] == "error":
+                                raise Exception(f"Agent execution error: {chunk['content']}")
+
                         if not output_str:
-                            output_str = json.dumps(tool_result)
-                else:
-                    # Generic / Unknown Node
-                    output_str = f"Skipped node '{node_id}' of unknown type '{node_type}'."
+                            output_str = "Agent completed execution with no response."
 
-                # Save output to carry forward
-                node_outputs[node_id] = output_str
-                context_state[node_id] = {
-                    "status": "success",
-                    "output": output_str
-                }
-            
-            # Finished execution of all nodes
+                    elif node_type == "toolNode":
+                        tool_name = node_data.get("toolName")
+                        if not tool_name:
+                            raise Exception("ToolNode has no toolName specified.")
+
+                        tool_args = node_data.get("arguments", {})
+                        if tool_name == "python_sandbox":
+                            code = tool_args.get("code", "")
+                            from app.services.agent_runner import execute_python_sandbox
+                            output_str = await execute_python_sandbox(code)
+                        else:
+                            mcp_client = await mcp_manager.get_tool_client(tool_name, session)
+                            if not mcp_client:
+                                raise Exception(f"MCP client for tool '{tool_name}' is not running.")
+                            tool_result = await mcp_client.call_tool(tool_name, tool_args)
+
+                            content_blocks = tool_result.get("content", [])
+                            for block in content_blocks:
+                                if block.get("type") == "text":
+                                    output_str += block.get("text", "")
+                            if not output_str:
+                                output_str = json.dumps(tool_result)
+                    else:
+                        output_str = f"Skipped node '{node_id}' of unknown type '{node_type}'."
+
+                    # Completed successfully
+                    node_outputs[node_id] = output_str
+                    db_log.state = "completed"
+                    db_log.output_data = output_str
+                    db_log.finished_at = datetime.utcnow()
+                    session.add(db_log)
+                    session.commit()
+                    return output_str
+
+                except Exception as node_err:
+                    attempts += 1
+                    db_log.retries_count = attempts
+                    session.add(db_log)
+                    session.commit()
+
+                    if attempts <= max_retries:
+                        logger.warning(f"Node '{node_id}' failed (attempt {attempts}/{max_retries+1}). Retrying in {backoff_seconds}s. Error: {node_err}")
+                        await asyncio.sleep(backoff_seconds)
+                        backoff_seconds *= 2  # Exponential backoff
+                    else:
+                        db_log.state = "failed"
+                        db_log.error_message = str(node_err)
+                        db_log.finished_at = datetime.utcnow()
+                        session.add(db_log)
+                        session.commit()
+                        raise node_err
+
+        try:
+            # Parallel scheduling execution loop
+            while len(node_outputs) < len(nodes):
+                # 1. Identify pending nodes whose dependencies are all completed
+                ready_nodes = []
+                for n_id in nodes:
+                    if node_states[n_id] == "pending":
+                        if all(node_states[p_id] == "completed" for p_id in parents[n_id]):
+                            ready_nodes.append(n_id)
+
+                if ready_nodes:
+                    for n_id in ready_nodes:
+                        node_states[n_id] = "running"
+                        node_tasks[n_id] = asyncio.create_task(run_single_node(n_id))
+
+                # 2. Wait for any active running node task to complete
+                running_tasks = {n_id: t for n_id, t in node_tasks.items() if not t.done()}
+                if not running_tasks:
+                    failed_nodes = [n_id for n_id in nodes if node_states[n_id] == "failed"]
+                    if failed_nodes:
+                        raise Exception(f"Workflow failed due to errors in nodes: {', '.join(failed_nodes)}")
+                    break
+
+                done, pending = await asyncio.wait(
+                    running_tasks.values(),
+                    return_when=asyncio.FIRST_COMPLETED
+                )
+
+                # Update states of finished node tasks
+                for n_id, t in running_tasks.items():
+                    if t.done():
+                        try:
+                            t.result()
+                            node_states[n_id] = "completed"
+                        except Exception as e:
+                            node_states[n_id] = "failed"
+                            raise e
+
+            # Successful completion
             execution.state = "completed"
             execution.output_data = json.dumps(node_outputs)
             execution.finished_at = datetime.utcnow()
             session.add(execution)
             session.commit()
             logger.info(f"Workflow execution {execution_id} completed successfully.")
-            
+            webhook_dispatcher.dispatch("workflow.completed", {
+                "execution_id": str(execution_id),
+                "workflow_id": str(workflow.id),
+                "state": "completed",
+                "output_data": node_outputs
+            })
+
         except Exception as err:
             logger.error(f"Workflow execution {execution_id} failed: {err}")
             execution.state = "failed"
@@ -208,5 +286,11 @@ class WorkflowRunner:
             execution.finished_at = datetime.utcnow()
             session.add(execution)
             session.commit()
+            webhook_dispatcher.dispatch("workflow.failed", {
+                "execution_id": str(execution_id),
+                "workflow_id": str(workflow.id),
+                "state": "failed",
+                "error": str(err)
+            })
 
 workflow_runner = WorkflowRunner()

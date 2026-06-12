@@ -208,38 +208,39 @@ async def websocket_chat_endpoint(
             # Stream response back
             response_content = ""
             if agent:
-                from app.services.agent_runner import agent_runner
-                async for chunk in agent_runner.execute_react_loop(
-                    agent=agent,
-                    conversation_history=ollama_messages[1:],
-                    session=session
-                ):
-                    if chunk["type"] == "token":
-                        response_content += chunk["content"]
-                        await websocket.send_text(json.dumps({
-                            "type": "token",
-                            "content": chunk["content"]
-                        }))
-                    elif chunk["type"] == "tool_start":
-                        await websocket.send_text(json.dumps({
-                            "type": "tool_start",
-                            "tool_name": chunk["tool_name"],
-                            "arguments": chunk["arguments"]
-                        }))
-                    elif chunk["type"] == "tool_end":
-                        await websocket.send_text(json.dumps({
-                            "type": "tool_end",
-                            "tool_name": chunk["tool_name"],
-                            "status": chunk["status"],
-                            "result": chunk["result"]
-                        }))
-                    elif chunk["type"] == "final_answer":
-                        response_content = chunk["content"]
-                    elif chunk["type"] == "error":
-                        await websocket.send_text(json.dumps({
-                            "type": "error",
-                            "content": chunk["content"]
-                        }))
+                import uuid
+                session_id = f"sess-{uuid.uuid4()}"
+                
+                # Subscribe to EventBus
+                from app.services.runtime_engine import runtime_engine
+                from app.core.database import Session as DBSession, engine as db_engine
+                
+                queue = runtime_engine.event_bus.subscribe(session_id)
+                
+                def db_session_factory():
+                    return DBSession(db_engine)
+                
+                # Launch background agent job
+                await runtime_engine.run_agent_job(
+                    session_id=session_id,
+                    agent_id=str(agent.id),
+                    messages=ollama_messages[1:],
+                    session_db_factory=db_session_factory
+                )
+                
+                try:
+                    while True:
+                        event = await queue.get()
+                        if event["type"] == "done":
+                            response_content = event["content"]
+                            break
+                        elif event["type"] == "error":
+                            await websocket.send_text(json.dumps(event))
+                            break
+                        else:
+                            await websocket.send_text(json.dumps(event))
+                finally:
+                    runtime_engine.event_bus.unsubscribe(session_id, queue)
             else:
                 async for token_chunk in ollama_service.chat_completion_stream(
                     model=model_name,
