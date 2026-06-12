@@ -20,14 +20,14 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy all source files
 COPY backend /app/backend
 
-# Set PYTHONPATH to include the base app directory
-ENV PYTHONPATH=/app/backend
-
 # Create directory for persistent local sqlite databases and assets
 RUN mkdir -p /app/storage
+
+# Set working directory to the backend directory
+WORKDIR /app/backend
 
 # Expose port
 EXPOSE 8000
 
-# Start command
-CMD ["uvicorn", "backend.app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+# Start command matching development entry point
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]

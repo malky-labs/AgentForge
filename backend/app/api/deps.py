@@ -39,6 +39,7 @@ def get_current_user(
         raise credentials_exception
         
     user = session.get(User, user_uuid)
+    if not user:
         raise credentials_exception
     if not user.is_active:
         raise HTTPException(

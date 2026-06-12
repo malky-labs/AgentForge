@@ -46,38 +46,4 @@ def read_root():
 def health_check():
     return {"status": "healthy"}
 
-# WebSocket Manager for chat events (Will refactor in Phase 2)
-class ConnectionManager:
-    def __init__(self):
-        self.active_connections: list[WebSocket] = []
-
-    async def connect(self, websocket: WebSocket):
-        await websocket.accept()
-        self.active_connections.append(websocket)
-
-    def disconnect(self, websocket: WebSocket):
-        self.active_connections.remove(websocket)
-
-    async def send_personal_message(self, message: str, websocket: WebSocket):
-        await websocket.send_text(message)
-
-manager = ConnectionManager()
-
-@app.websocket("/api/v1/ws/chat/{conversation_id}")
-async def websocket_endpoint(websocket: WebSocket, conversation_id: str):
-    await manager.connect(websocket)
-    logger.info(f"WebSocket connected for conversation: {conversation_id}")
-    try:
-        while True:
-            # Handle incoming client commands
-            data = await websocket.receive_text()
-            logger.info(f"Received from client in {conversation_id}: {data}")
-            
-            # Streaming mock tokens back as proof-of-concept
-            await manager.send_personal_message(
-                f'{{"type": "token", "content": "Acknowledged: \'{data}\'. Processing local inference agent task..."}}', 
-                websocket
-            )
-    except WebSocketDisconnect:
-        manager.disconnect(websocket)
-        logger.info(f"WebSocket disconnected for conversation: {conversation_id}")
+# Server is clean and modular. Routers are registered in api_router.

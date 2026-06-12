@@ -145,3 +145,33 @@ class Token(SQLModel):
     access_token: str
     token_type: str
 
+
+class AgentCreate(SQLModel):
+    name: str
+    description: Optional[str] = None
+    system_prompt: str
+    model_provider: str = "ollama"
+    model_name: str
+    temperature: Optional[float] = 0.7
+    max_tokens: Optional[int] = 2048
+    memory_limit: Optional[int] = 10
+    permissions: Optional[str] = "{}"
+
+
+class McpServerCreate(SQLModel):
+    name: str
+    command: str
+    args: Optional[str] = "[]"
+    env: Optional[str] = "{}"
+
+
+class WorkflowCreate(SQLModel):
+    name: str
+    description: Optional[str] = None
+    graph_json: str
+    is_active: Optional[bool] = True
+    trigger_type: Optional[str] = "manual"
+
+
+
+
