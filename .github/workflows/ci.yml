@@ -1,0 +1,52 @@
+name: AgentForge CI/CD
+
+on:
+  push:
+    branches: [ main, dev ]
+  pull_request:
+    branches: [ main, dev ]
+
+jobs:
+  backend-lint-test:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+        cache: 'pip'
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install ruff pytest httpx fastapi sqlmodel
+
+    - name: Lint with Ruff
+      run: ruff check backend/
+
+    - name: Run Pytest
+      run: |
+        cd backend
+        pytest --ignore=tests/integration/
+
+  frontend-lint-test:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '20'
+
+    - name: Install Frontend Dependencies
+      run: |
+        cd frontend
+        npm install
+
+    - name: Lint Next.js App
+      run: |
+        cd frontend
+        npm run lint

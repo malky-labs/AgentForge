@@ -1,0 +1,81 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: agentforge-postgres
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: secretpassword
+      POSTGRES_DB: agentforge
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    networks:
+      - agentforge-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  backend:
+    build:
+      context: ..
+      dockerfile: docker/backend.Dockerfile
+    container_name: agentforge-backend
+    ports:
+      - "8000:8000"
+    environment:
+      - DATABASE_URL=postgresql://postgres:secretpassword@postgres:5432/agentforge
+      - OLLAMA_HOST=http://ollama:11434
+      - JWT_SECRET=change-this-to-a-super-secret-random-key-for-prod
+      - ENVIRONMENT=production
+    volumes:
+      - backend-storage:/app/storage
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - agentforge-network
+
+  frontend:
+    build:
+      context: ..
+      dockerfile: docker/frontend.Dockerfile
+    container_name: agentforge-frontend
+    ports:
+      - "3000:3000"
+    environment:
+      - NEXT_PUBLIC_API_URL=http://backend:8000
+    depends_on:
+      - backend
+    networks:
+      - agentforge-network
+
+  ollama:
+    image: ollama/ollama:latest
+    container_name: agentforge-ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama-models:/root/.ollama
+    networks:
+      - agentforge-network
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+volumes:
+  pgdata:
+  backend-storage:
+  ollama-models:
+
+networks:
+  agentforge-network:
+    driver: bridge
